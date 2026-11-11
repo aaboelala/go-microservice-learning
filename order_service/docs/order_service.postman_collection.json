@@ -1,0 +1,436 @@
+{
+	"info": {
+		"_postman_id": "7b8d4f12-9c3a-4a25-b82e-6d1a2f3c4e5b",
+		"name": "Order Service API",
+		"description": "Postman Collection for Order Service (MVP 1.0) REST endpoints, including JWT authentication, order placement, pagination, details retrieval, and order cancellation.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8082",
+			"type": "string"
+		},
+		{
+			"key": "token",
+			"value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxLCJyb2xlIjoiY3VzdG9tZXIiLCJleHAiOjE5MjA4ODAwMDB9.sample_signature_replace_with_valid_jwt",
+			"type": "string"
+		},
+		{
+			"key": "orderId",
+			"value": "1",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Health Check",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/health",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"health"
+					]
+				},
+				"description": "Checks the health status of the Order Service and its PostgreSQL database connection."
+			},
+			"response": [
+				{
+					"name": "200 OK",
+					"originalRequest": {
+						"method": "GET",
+						"url": {
+							"raw": "{{baseUrl}}/health",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"health"
+							]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"status\": \"ok\"\n}"
+				}
+			]
+		},
+		{
+			"name": "Create Order",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"var jsonData = pm.response.json();",
+							"if (jsonData && jsonData.data && jsonData.data.id) {",
+							"    pm.collectionVariables.set(\"orderId\", jsonData.data.id);",
+							"}"
+						],
+						"type": "text/javascript"
+					}
+				}
+			],
+			"request": {
+				"auth": {
+					"type": "bearer",
+					"bearer": [
+						{
+							"key": "token",
+							"value": "{{token}}",
+							"type": "string"
+						}
+					]
+				},
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"items\": [\n    {\n      \"product_id\": 1,\n      \"quantity\": 2\n    },\n    {\n      \"product_id\": 5,\n      \"quantity\": 1\n    }\n  ]\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{baseUrl}}/orders",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"orders"
+					]
+				},
+				"description": "Creates a new order for the authenticated user.\n- Validates items list (quantity > 0, no duplicate product IDs).\n- Synchronously validates product existence, active status, and stock via Product Service gRPC.\n- Snapshots product name and unit price.\n- Commits order and line items inside a single database transaction.\n- Sets initial status to PENDING."
+			},
+			"response": [
+				{
+					"name": "201 Created",
+					"originalRequest": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							},
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"items\": [\n    {\n      \"product_id\": 1,\n      \"quantity\": 2\n    },\n    {\n      \"product_id\": 5,\n      \"quantity\": 1\n    }\n  ]\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}/orders",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"orders"
+							]
+						}
+					},
+					"status": "Created",
+					"code": 201,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": true,\n  \"data\": {\n    \"id\": 1,\n    \"user_id\": 1,\n    \"status\": \"PENDING\",\n    \"total\": 59.97,\n    \"created_at\": \"2026-11-02T12:00:00Z\",\n    \"updated_at\": \"2026-11-02T12:00:00Z\",\n    \"items\": [\n      {\n        \"id\": 1,\n        \"order_id\": 1,\n        \"product_id\": 1,\n        \"product_name\": \"Mechanical Keyboard\",\n        \"quantity\": 2,\n        \"unit_price\": 19.99,\n        \"line_total\": 39.98,\n        \"created_at\": \"2026-11-02T12:00:00Z\"\n      },\n      {\n        \"id\": 2,\n        \"order_id\": 1,\n        \"product_id\": 5,\n        \"product_name\": \"USB-C Cable\",\n        \"quantity\": 1,\n        \"unit_price\": 19.99,\n        \"line_total\": 19.99,\n        \"created_at\": \"2026-11-02T12:00:00Z\"\n      }\n    ]\n  }\n}"
+				},
+				{
+					"name": "400 Bad Request - Duplicate Items",
+					"status": "Bad Request",
+					"code": 400,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": false,\n  \"message\": \"duplicate product id in order items\"\n}"
+				},
+				{
+					"name": "409 Conflict - Insufficient Stock",
+					"status": "Conflict",
+					"code": 409,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": false,\n  \"message\": \"insufficient stock for requested product: product ID 1 requested 100, available 5\"\n}"
+				},
+				{
+					"name": "422 Unprocessable Entity - Product Not Found",
+					"status": "Unprocessable Entity",
+					"code": 422,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": false,\n  \"message\": \"product not found: product ID 999\"\n}"
+				}
+			]
+		},
+		{
+			"name": "Get My Orders",
+			"request": {
+				"auth": {
+					"type": "bearer",
+					"bearer": [
+						{
+							"key": "token",
+							"value": "{{token}}",
+							"type": "string"
+						}
+					]
+				},
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/orders?page=1&limit=10",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"orders"
+					],
+					"query": [
+						{
+							"key": "page",
+							"value": "1",
+							"description": "Page number (defaults to 1)"
+						},
+						{
+							"key": "limit",
+							"value": "10",
+							"description": "Number of items per page (defaults to 10, max 100)"
+						}
+					]
+				},
+				"description": "Retrieves a paginated list of orders belonging strictly to the authenticated user, ordered newest first."
+			},
+			"response": [
+				{
+					"name": "200 OK",
+					"originalRequest": {
+						"method": "GET",
+						"url": {
+							"raw": "{{baseUrl}}/orders?page=1&limit=10",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"orders"
+							],
+							"query": [
+								{
+									"key": "page",
+									"value": "1"
+								},
+								{
+									"key": "limit",
+									"value": "10"
+								}
+							]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": true,\n  \"data\": [\n    {\n      \"id\": 1,\n      \"user_id\": 1,\n      \"status\": \"PENDING\",\n      \"total\": 59.97,\n      \"created_at\": \"2026-11-02T12:00:00Z\",\n      \"updated_at\": \"2026-11-02T12:00:00Z\",\n      \"items\": [\n        {\n          \"id\": 1,\n          \"order_id\": 1,\n          \"product_id\": 1,\n          \"product_name\": \"Mechanical Keyboard\",\n          \"quantity\": 2,\n          \"unit_price\": 19.99,\n          \"line_total\": 39.98,\n          \"created_at\": \"2026-11-02T12:00:00Z\"\n        }\n      ]\n    }\n  ],\n  \"pagination\": {\n    \"page\": 1,\n    \"limit\": 10,\n    \"total_items\": 1,\n    \"total_pages\": 1\n  }\n}"
+				}
+			]
+		},
+		{
+			"name": "Get Order Details",
+			"request": {
+				"auth": {
+					"type": "bearer",
+					"bearer": [
+						{
+							"key": "token",
+							"value": "{{token}}",
+							"type": "string"
+						}
+					]
+				},
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/orders/{{orderId}}",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"orders",
+						"{{orderId}}"
+					]
+				},
+				"description": "Retrieves full details of a specific order by ID including line items.\nEnforces ownership: returns 404 if the order does not belong to the authenticated user."
+			},
+			"response": [
+				{
+					"name": "200 OK",
+					"originalRequest": {
+						"method": "GET",
+						"url": {
+							"raw": "{{baseUrl}}/orders/{{orderId}}",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"orders",
+								"{{orderId}}"
+							]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": true,\n  \"data\": {\n    \"id\": 1,\n    \"user_id\": 1,\n    \"status\": \"PENDING\",\n    \"total\": 59.97,\n    \"created_at\": \"2026-11-02T12:00:00Z\",\n    \"updated_at\": \"2026-11-02T12:00:00Z\",\n    \"items\": [\n      {\n        \"id\": 1,\n        \"order_id\": 1,\n        \"product_id\": 1,\n        \"product_name\": \"Mechanical Keyboard\",\n        \"quantity\": 2,\n        \"unit_price\": 19.99,\n        \"line_total\": 39.98,\n        \"created_at\": \"2026-11-02T12:00:00Z\"\n      },\n      {\n        \"id\": 2,\n        \"order_id\": 1,\n        \"product_id\": 5,\n        \"product_name\": \"USB-C Cable\",\n        \"quantity\": 1,\n        \"unit_price\": 19.99,\n        \"line_total\": 19.99,\n        \"created_at\": \"2026-11-02T12:00:00Z\"\n      }\n    ]\n  }\n}"
+				},
+				{
+					"name": "404 Not Found",
+					"status": "Not Found",
+					"code": 404,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": false,\n  \"message\": \"Order not found\"\n}"
+				}
+			]
+		},
+		{
+			"name": "Cancel Order",
+			"request": {
+				"auth": {
+					"type": "bearer",
+					"bearer": [
+						{
+							"key": "token",
+							"value": "{{token}}",
+							"type": "string"
+						}
+					]
+				},
+				"method": "POST",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/orders/{{orderId}}/cancel",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"orders",
+						"{{orderId}}",
+						"cancel"
+					]
+				},
+				"description": "Cancels an existing order.\n- Only permitted when current order status is PENDING.\n- Transitions status to CANCELLED.\n- Returns 409 Conflict if order is already cancelled or in an unsupported state."
+			},
+			"response": [
+				{
+					"name": "200 OK",
+					"originalRequest": {
+						"method": "POST",
+						"url": {
+							"raw": "{{baseUrl}}/orders/{{orderId}}/cancel",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"orders",
+								"{{orderId}}",
+								"cancel"
+							]
+						}
+					},
+					"status": "OK",
+					"code": 200,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": true,\n  \"message\": \"Order cancelled successfully\",\n  \"data\": {\n    \"id\": 1,\n    \"user_id\": 1,\n    \"status\": \"CANCELLED\",\n    \"total\": 59.97,\n    \"created_at\": \"2026-11-02T12:00:00Z\",\n    \"updated_at\": \"2026-11-02T12:05:00Z\",\n    \"items\": []\n  }\n}"
+				},
+				{
+					"name": "409 Conflict - Already Cancelled",
+					"status": "Conflict",
+					"code": 409,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": false,\n  \"message\": \"order is already cancelled\"\n}"
+				},
+				{
+					"name": "404 Not Found",
+					"status": "Not Found",
+					"code": 404,
+					"_postman_previewlanguage": "json",
+					"header": [
+						{
+							"key": "Content-Type",
+							"value": "application/json"
+						}
+					],
+					"body": "{\n  \"success\": false,\n  \"message\": \"Order not found\"\n}"
+				}
+			]
+		}
+	]
+}
+

@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package product.v1;
+
+option go_package = "product_service/proto/product/v1;productv1";
+
+// ProductService exposes product operations for inter-service communication (e.g. Order Service).
+service ProductService {
+  // GetProduct retrieves a single product by its unique identifier.
+  rpc GetProduct(GetProductRequest) returns (GetProductResponse);
+}
+
+// GetProductRequest contains the identifier of the product to fetch.
+message GetProductRequest {
+  uint64 id = 1;
+}
+
+// GetProductResponse returns the product details required by the Order Service.
+message GetProductResponse {
+  uint64 id = 1;
+  string name = 2;
+  string description = 3;
+  double price = 4;
+  int32 stock = 5;
+  string status = 6;
+  bool is_active = 7;
+  uint64 category_id = 8;
+  uint64 owner_id = 9;
+}
