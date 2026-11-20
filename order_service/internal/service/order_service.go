@@ -2,14 +2,17 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"order_service/internal/client"
 	"order_service/internal/dto"
 	"order_service/internal/entity"
+	"order_service/internal/events"
 	"order_service/internal/repository"
 )
 
@@ -46,7 +49,8 @@ func NewOrderService(orderRepo repository.OrderRepository, productClient client.
 }
 
 // CreateOrder validates input, fetches and verifies product data from Product Service via gRPC,
-// calculates order snapshots and totals using precise integer cents, and commits the order atomically.
+// calculates order snapshots and totals using precise integer cents, constructs the OrderCreated event,
+// and commits both the order and outbox record atomically inside a single database transaction.
 func (s *orderService) CreateOrder(ctx context.Context, userID uint, req *dto.CreateOrderRequest) (*dto.OrderResponse, error) {
 	if req == nil {
 		return nil, dto.ErrEmptyOrderItems
@@ -58,7 +62,11 @@ func (s *orderService) CreateOrder(ctx context.Context, userID uint, req *dto.Cr
 	orderItems := make([]entity.OrderItem, 0, len(req.Items))
 	var orderTotalCents int64
 
-	// Sequential product lookups to avoid unbounded concurrency and respect the single-product gRPC contract
+	// Engineering Decision 1: Why product lookups happen before database persistence.
+	// We perform remote gRPC product lookups and validations strictly before starting any database transaction.
+	// If remote product calls were made inside a database transaction, remote network latency or outages
+	// would hold database connections and row/table locks open indefinitely, exhausting the connection pool.
+	// Fetching authoritative pricing and stock upfront ensures database transactions remain short and lean.
 	for _, item := range req.Items {
 		product, err := s.productClient.GetProduct(ctx, item.ProductID)
 		if err != nil {
@@ -74,7 +82,10 @@ func (s *orderService) CreateOrder(ctx context.Context, userID uint, req *dto.Cr
 			return nil, fmt.Errorf("%w: product ID %d requested %d, available %d", ErrInsufficientStock, item.ProductID, item.Quantity, product.Stock)
 		}
 
-		// Precision conversion to integer cents to avoid IEEE 754 floating point inaccuracies
+		// Engineering Decision 2: Why order totals are calculated using integer cents.
+		// Standard IEEE 754 floating-point numbers cannot accurately represent base-10 fractions (e.g. 0.1 + 0.2 != 0.3).
+		// By converting unit prices into integer cents (minor units), multiplying by quantities, and summing integers,
+		// we avoid cumulative rounding errors and financial calculation drift.
 		unitPriceCents := int64(math.Round(product.Price * 100))
 		lineTotalCents := int64(item.Quantity) * unitPriceCents
 		orderTotalCents += lineTotalCents
@@ -95,10 +106,60 @@ func (s *orderService) CreateOrder(ctx context.Context, userID uint, req *dto.Cr
 		Items:  orderItems,
 	}
 
-	if err := s.orderRepo.CreateOrderWithItems(ctx, order); err != nil {
+	// Engineering Decision 3: Why the OrderCreated event is constructed.
+	// Asynchronous event publication decouples Order Service from downstream systems (e.g., Notification Service,
+	// Inventory Decrement, Payment Processing, Analytics). Constructing a strongly-typed OrderCreated event
+	// using the shared Event Contract ensures schema consistency across service boundaries.
+	//
+	// Engineering Decision 4: Why Order and Outbox record must be persisted in the SAME database transaction.
+	// Saving business state and dispatching events represents a distributed state problem (the "Dual-Write Problem").
+	// If the order is committed to PostgreSQL but event publishing fails, downstream services never learn of the order.
+	// Conversely, if an event is published but the database transaction rolls back, downstream services act on phantom orders.
+	// By persisting the Order, OrderItems, and the Outbox record inside one atomic PostgreSQL transaction,
+	// we achieve an all-or-nothing invariant: either both the order and outbox record exist, or neither does.
+	//
+	// Engineering Decision 5: Why CreateOrder does NOT publish directly to RabbitMQ.
+	// Direct publishing in the HTTP request path introduces a hard dependency on RabbitMQ's immediate availability
+	// and network latency. If RabbitMQ is down, slow, or undergoing maintenance, order placement requests would fail.
+	// By decoupling persistence from publishing via the Outbox table, Order Service remains fully operational
+	// even when RabbitMQ is temporarily unreachable.
+	err := s.orderRepo.CreateOrderWithOutbox(ctx, order, func(orderID uint64) (*entity.OutboxEvent, error) {
+		// Instantiate the event envelope using the database-assigned orderID
+		event, err := events.NewOrderCreatedEvent(orderID, order.UserID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to instantiate order.created event: %w", err)
+		}
+
+		payloadBytes, err := json.Marshal(event)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize order.created event envelope: %w", err)
+		}
+
+		return &entity.OutboxEvent{
+			EventID:    event.EventID,
+			EventType:  event.EventType,
+			Exchange:   "order.events",
+			RoutingKey: event.EventType, // "order.created"
+			Payload:    payloadBytes,
+			Status:     entity.OutboxStatusPending,
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+		}, nil
+	})
+	if err != nil {
 		return nil, fmt.Errorf("failed to create order: %w", err)
 	}
 
+	// Engineering Decision 6: Why the service returns success once the database transaction commits.
+	// The database transaction commit guarantees that the order is safely persisted and durable. Because the
+	// corresponding outbox event is also committed, eventual publication to RabbitMQ is guaranteed.
+	// The client receives immediate HTTP 201 Created confirmation without waiting on broker network hops.
+	//
+	// Engineering Decision 7: How the Outbox Dispatcher takes responsibility for eventual publishing.
+	// An independent background Dispatcher worker continually reads pending outbox records from PostgreSQL,
+	// claims them safely using FOR UPDATE SKIP LOCKED, publishes them with RabbitMQ Publisher Confirms,
+	// and marks them as PUBLISHED only after broker confirmation. If publishing fails or RabbitMQ is temporarily down,
+	// the Dispatcher retries with exponential backoff, ensuring reliable at-least-once delivery.
 	resp := mapOrderToDTO(order)
 	return resp, nil
 }
@@ -207,4 +268,3 @@ func mapOrderToDTO(order *entity.Order) *dto.OrderResponse {
 		Items:     itemsDTO,
 	}
 }
-

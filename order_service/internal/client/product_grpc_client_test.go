@@ -140,4 +140,3 @@ func TestProductGRPCClient_GetProduct_DeadlineExceeded(t *testing.T) {
 	_, err = c.GetProduct(context.Background(), 1)
 	assert.ErrorIs(t, err, client.ErrProductServiceTimeout)
 }
-

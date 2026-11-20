@@ -18,6 +18,7 @@ var (
 // OrderRepository defines data persistence operations for orders and items.
 type OrderRepository interface {
 	CreateOrderWithItems(ctx context.Context, order *entity.Order) error
+	CreateOrderWithOutbox(ctx context.Context, order *entity.Order, buildOutbox func(orderID uint64) (*entity.OutboxEvent, error)) error
 	GetOrdersByUserID(ctx context.Context, userID uint, offset, limit int) ([]entity.Order, int64, error)
 	GetOrderByID(ctx context.Context, orderID uint64) (*entity.Order, error)
 	UpdateOrderStatus(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus) error
@@ -34,10 +35,38 @@ func NewOrderRepository(db *gorm.DB) OrderRepository {
 
 // CreateOrderWithItems persists an Order and all its associated OrderItems inside an atomic database transaction.
 func (r *orderRepository) CreateOrderWithItems(ctx context.Context, order *entity.Order) error {
+	return r.CreateOrderWithOutbox(ctx, order, nil)
+}
+
+// CreateOrderWithOutbox persists an Order, its OrderItems, and its corresponding OutboxEvent
+// atomically inside the exact same database transaction.
+// If any step fails or an error occurs, the entire transaction is rolled back, guaranteeing
+// that no partial state (such as an order without an outbox event, or vice-versa) is ever committed.
+func (r *orderRepository) CreateOrderWithOutbox(
+	ctx context.Context,
+	order *entity.Order,
+	buildOutbox func(orderID uint64) (*entity.OutboxEvent, error),
+) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Step 1: Persist the Order and its cascaded OrderItems
 		if err := tx.Create(order).Error; err != nil {
 			return fmt.Errorf("failed to persist order and items: %w", err)
 		}
+
+		// Step 2: If an outbox builder is supplied, build and persist the OutboxEvent
+		// using the authoritative auto-generated order.ID within the same transaction.
+		if buildOutbox != nil {
+			outbox, err := buildOutbox(order.ID)
+			if err != nil {
+				return fmt.Errorf("failed to construct outbox event: %w", err)
+			}
+			if outbox != nil {
+				if err := tx.Create(outbox).Error; err != nil {
+					return fmt.Errorf("failed to persist outbox event: %w", err)
+				}
+			}
+		}
+
 		return nil
 	})
 }
@@ -99,4 +128,3 @@ func (r *orderRepository) UpdateOrderStatus(ctx context.Context, orderID uint64,
 
 	return nil
 }
-

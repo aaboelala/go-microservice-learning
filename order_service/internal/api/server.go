@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"order_service/internal/api/rest/handler"
 	"order_service/internal/client"
 	"order_service/internal/helper"
+	"order_service/internal/messaging/outbox"
+	"order_service/internal/messaging/rabbitmq"
 
 	"github.com/gofiber/fiber/v2"
 	"gorm.io/gorm"
@@ -22,10 +25,13 @@ import (
 
 // Server coordinates the HTTP server lifecycle and its underlying dependencies.
 type Server struct {
-	app           *fiber.App
-	db            *gorm.DB
-	cfg           *config.Config
-	productClient client.ProductClient
+	app              *fiber.App
+	db               *gorm.DB
+	cfg              *config.Config
+	productClient    client.ProductClient
+	rabbitClient     *rabbitmq.Client
+	rabbitPublisher  rabbitmq.EventPublisher
+	outboxDispatcher *outbox.Dispatcher
 }
 
 // NewServer initializes the Fiber app, registers health and order routes, and returns a Server.
@@ -35,6 +41,9 @@ func NewServer(
 	orderHandler *handler.OrderHandler,
 	tokenHelper *helper.TokenHelper,
 	productClient client.ProductClient,
+	rabbitClient *rabbitmq.Client,
+	rabbitPublisher rabbitmq.EventPublisher,
+	outboxDispatcher *outbox.Dispatcher,
 ) *Server {
 	app := fiber.New(fiber.Config{
 		CaseSensitive: true,
@@ -72,10 +81,13 @@ func NewServer(
 	rest.SetupRoutes(app, orderHandler, tokenHelper)
 
 	return &Server{
-		app:           app,
-		db:            db,
-		cfg:           cfg,
-		productClient: productClient,
+		app:              app,
+		db:               db,
+		cfg:              cfg,
+		productClient:    productClient,
+		rabbitClient:     rabbitClient,
+		rabbitPublisher:  rabbitPublisher,
+		outboxDispatcher: outboxDispatcher,
 	}
 }
 
@@ -86,6 +98,20 @@ func (s *Server) Start() error {
 	errChan := make(chan error, 1)
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// Managed context for background worker goroutines
+	dispatcherCtx, cancelDispatcher := context.WithCancel(context.Background())
+	defer cancelDispatcher()
+
+	// Start Outbox Dispatcher in a managed background goroutine
+	if s.outboxDispatcher != nil {
+		go func() {
+			log.Println("Starting Outbox Dispatcher background worker...")
+			if err := s.outboxDispatcher.Start(dispatcherCtx); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("Outbox Dispatcher stopped with error: %v", err)
+			}
+		}()
+	}
 
 	go func() {
 		log.Printf("Starting Order Service HTTP server on %s", addr)
@@ -103,13 +129,34 @@ func (s *Server) Start() error {
 		serverErr = err
 	}
 
-	// 1. Gracefully shutdown Fiber HTTP server
+	// 1. Gracefully stop Outbox Dispatcher so it drains/completes active batch without leaking goroutines
+	if s.outboxDispatcher != nil {
+		log.Println("Stopping Outbox Dispatcher...")
+		s.outboxDispatcher.Stop()
+		cancelDispatcher()
+	}
+
+	// 2. Gracefully shutdown Fiber HTTP server
 	log.Println("Shutting down HTTP server...")
 	if err := s.app.ShutdownWithTimeout(10 * time.Second); err != nil {
 		log.Printf("HTTP server shutdown error: %v", err)
 	}
 
-	// 2. Close Product Service gRPC Client Connection
+	// 3. Close RabbitMQ Publisher and Connection
+	if s.rabbitPublisher != nil {
+		log.Println("Closing RabbitMQ Publisher...")
+		if err := s.rabbitPublisher.Close(); err != nil {
+			log.Printf("Error closing RabbitMQ publisher: %v", err)
+		}
+	}
+	if s.rabbitClient != nil {
+		log.Println("Closing RabbitMQ connection...")
+		if err := s.rabbitClient.Close(); err != nil {
+			log.Printf("Error closing RabbitMQ connection: %v", err)
+		}
+	}
+
+	// 4. Close Product Service gRPC Client Connection
 	if s.productClient != nil {
 		log.Println("Closing Product Service gRPC connection...")
 		if err := s.productClient.Close(); err != nil {
@@ -117,7 +164,7 @@ func (s *Server) Start() error {
 		}
 	}
 
-	// 3. Close Database Connection Pool
+	// 5. Close Database Connection Pool
 	if s.db != nil {
 		log.Println("Closing database connections...")
 		sqlDB, err := s.db.DB()
@@ -134,4 +181,3 @@ func (s *Server) Start() error {
 func (s *Server) App() *fiber.App {
 	return s.app
 }
-

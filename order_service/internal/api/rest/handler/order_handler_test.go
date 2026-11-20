@@ -335,4 +335,3 @@ func TestHandler_CancelOrder(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusNotFound, respNF.StatusCode)
 }
-

@@ -33,4 +33,3 @@ func AuthMiddleware(tokenHelper *helper.TokenHelper) fiber.Handler {
 		return ctx.Next()
 	}
 }
-

@@ -39,15 +39,41 @@ func (m *mockProductClient) Close() error {
 // --- Mock Order Repository ---
 
 type mockOrderRepository struct {
-	createOrderWithItemsFn func(ctx context.Context, order *entity.Order) error
-	getOrdersByUserIDFn    func(ctx context.Context, userID uint, offset, limit int) ([]entity.Order, int64, error)
-	getOrderByIDFn         func(ctx context.Context, orderID uint64) (*entity.Order, error)
-	updateOrderStatusFn    func(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus) error
+	createOrderWithItemsFn  func(ctx context.Context, order *entity.Order) error
+	createOrderWithOutboxFn func(ctx context.Context, order *entity.Order, buildOutbox func(orderID uint64) (*entity.OutboxEvent, error)) error
+	getOrdersByUserIDFn     func(ctx context.Context, userID uint, offset, limit int) ([]entity.Order, int64, error)
+	getOrderByIDFn          func(ctx context.Context, orderID uint64) (*entity.Order, error)
+	updateOrderStatusFn     func(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus) error
 }
 
 func (m *mockOrderRepository) CreateOrderWithItems(ctx context.Context, order *entity.Order) error {
 	if m.createOrderWithItemsFn != nil {
 		return m.createOrderWithItemsFn(ctx, order)
+	}
+	return nil
+}
+
+func (m *mockOrderRepository) CreateOrderWithOutbox(
+	ctx context.Context,
+	order *entity.Order,
+	buildOutbox func(orderID uint64) (*entity.OutboxEvent, error),
+) error {
+	if m.createOrderWithOutboxFn != nil {
+		return m.createOrderWithOutboxFn(ctx, order, buildOutbox)
+	}
+	if m.createOrderWithItemsFn != nil {
+		if err := m.createOrderWithItemsFn(ctx, order); err != nil {
+			return err
+		}
+		if buildOutbox != nil {
+			if order.ID == 0 {
+				order.ID = 1 // Simulate database autoincrement primary key if mock did not set it
+			}
+			if _, err := buildOutbox(order.ID); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return nil
 }
@@ -318,6 +344,110 @@ func TestCreateOrder_DatabaseRollbackOnSaveFailure(t *testing.T) {
 	assert.Contains(t, err.Error(), "failed to create order")
 }
 
+func TestCreateOrder_OutboxEventPersistedWithOrder(t *testing.T) {
+	mockProd := &mockProductClient{
+		getProductFn: func(ctx context.Context, id uint64) (*client.ProductInfo, error) {
+			return &client.ProductInfo{
+				ID:       1,
+				Name:     "Wireless Mouse",
+				Price:    25.00,
+				Stock:    10,
+				Status:   "ACTIVE",
+				IsActive: true,
+			}, nil
+		},
+	}
+
+	var capturedOutbox *entity.OutboxEvent
+	mockRepo := &mockOrderRepository{
+		createOrderWithOutboxFn: func(ctx context.Context, order *entity.Order, buildOutbox func(orderID uint64) (*entity.OutboxEvent, error)) error {
+			order.ID = 555
+			for i := range order.Items {
+				order.Items[i].ID = 888
+				order.Items[i].OrderID = order.ID
+			}
+
+			outbox, err := buildOutbox(order.ID)
+			if err != nil {
+				return err
+			}
+			capturedOutbox = outbox
+			return nil
+		},
+	}
+
+	svc := service.NewOrderService(mockRepo, mockProd)
+	req := &dto.CreateOrderRequest{
+		Items: []dto.CreateOrderItemRequest{{ProductID: 1, Quantity: 2}},
+	}
+
+	resp, err := svc.CreateOrder(context.Background(), 42, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, uint64(555), resp.ID)
+
+	// Verify Outbox event was properly constructed using the existing Event Contract
+	require.NotNil(t, capturedOutbox)
+	assert.NotEmpty(t, capturedOutbox.EventID)
+	assert.Equal(t, "order.created", capturedOutbox.EventType)
+	assert.Equal(t, "order.events", capturedOutbox.Exchange)
+	assert.Equal(t, "order.created", capturedOutbox.RoutingKey)
+	assert.Equal(t, entity.OutboxStatusPending, capturedOutbox.Status)
+	assert.Contains(t, string(capturedOutbox.Payload), `"order_id":555`)
+	assert.Contains(t, string(capturedOutbox.Payload), `"user_id":42`)
+	assert.Contains(t, string(capturedOutbox.Payload), `"event_type":"order.created"`)
+}
+
+func TestCreateOrder_RabbitMQOfflineDoesNotBlockOrderCreation(t *testing.T) {
+	// Demonstrates the core value of the Transactional Outbox:
+	// OrderService does not have any direct dependency on RabbitMQ.
+	// Even if RabbitMQ is completely offline, Order creation succeeds
+	// as long as the PostgreSQL transaction persists the order and outbox record.
+	mockProd := &mockProductClient{
+		getProductFn: func(ctx context.Context, id uint64) (*client.ProductInfo, error) {
+			return &client.ProductInfo{
+				ID:       1,
+				Name:     "Keyboard",
+				Price:    50.00,
+				Stock:    10,
+				Status:   "ACTIVE",
+				IsActive: true,
+			}, nil
+		},
+	}
+
+	orderPersisted := false
+	outboxPersisted := false
+
+	mockRepo := &mockOrderRepository{
+		createOrderWithOutboxFn: func(ctx context.Context, order *entity.Order, buildOutbox func(orderID uint64) (*entity.OutboxEvent, error)) error {
+			order.ID = 777
+			orderPersisted = true
+
+			outbox, err := buildOutbox(order.ID)
+			if err != nil {
+				return err
+			}
+			if outbox != nil {
+				outboxPersisted = true
+			}
+			return nil
+		},
+	}
+
+	svc := service.NewOrderService(mockRepo, mockProd)
+	req := &dto.CreateOrderRequest{
+		Items: []dto.CreateOrderItemRequest{{ProductID: 1, Quantity: 1}},
+	}
+
+	// RabbitMQ is not initialized, running, or injected — order creation succeeds!
+	resp, err := svc.CreateOrder(context.Background(), 10, req)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(777), resp.ID)
+	assert.True(t, orderPersisted)
+	assert.True(t, outboxPersisted)
+}
+
 func TestCreateOrder_FinancialPrecision(t *testing.T) {
 	// Floating point edge cases: e.g. 0.1 + 0.2 != 0.3 in IEEE 754 float
 	// Price: 19.99 * 3 = 59.97
@@ -559,4 +689,3 @@ func TestCancelOrder_UnsupportedStatus(t *testing.T) {
 	_, err := svc.CancelOrder(context.Background(), 7, 12)
 	assert.ErrorIs(t, err, service.ErrInvalidCancellationStatus)
 }
-

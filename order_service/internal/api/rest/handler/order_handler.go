@@ -196,4 +196,3 @@ func (h *OrderHandler) handleServiceError(c *fiber.Ctx, err error) error {
 		"message": "Internal server error",
 	})
 }
-

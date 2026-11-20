@@ -151,4 +151,3 @@ func TestValidateToken_ZeroUserID(t *testing.T) {
 	assert.ErrorIs(t, err, helper.ErrInvalidClaims)
 	assert.Contains(t, fmt.Sprint(err), "missing or zero")
 }
-

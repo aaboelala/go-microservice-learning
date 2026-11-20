@@ -13,6 +13,7 @@
 9. [Error Handling](#9-error-handling)
 10. [Configuration](#10-configuration)
 11. [Running Locally](#11-running-locally)
+12. [Transactional Outbox Pattern & Event Publishing](#12-transactional-outbox-pattern--event-publishing)
 
 ---
 
@@ -522,6 +523,7 @@ These domain errors propagate from the client → service → handler, where the
 | `JWT_EXPIRATION` | `24h` | Not used for validation — informational only |
 | `PRODUCT_SERVICE_GRPC_ADDR` | `127.0.0.1:50051` | gRPC address of product_service |
 | `PRODUCT_SERVICE_TIMEOUT_SECONDS` | `3` | Per-call deadline for gRPC calls to product_service |
+| `RABBITMQ_URL` | `amqp://guest:guest@localhost:5672/` | AMQP 0-9-1 connection string for RabbitMQ broker |
 
 ---
 
@@ -553,3 +555,224 @@ curl http://localhost:8082/orders \
 # 6. Health check
 curl http://localhost:8082/health
 ```
+
+---
+
+## 12. Transactional Outbox Pattern & Event Publishing
+
+### 12.1 Motivation: Eliminating the Dual-Write Problem
+
+In a distributed microservice architecture, creating an order in the database and publishing a notification event to RabbitMQ constitutes two separate writes to two independent systems (PostgreSQL and RabbitMQ).
+
+```
+Direct Publishing Anti-Pattern:
+HTTP Request ──► Save Order (PostgreSQL) ──► Publish Event (RabbitMQ) ──► HTTP 201
+                         │                             │
+                         ▼                             ▼
+                 Order committed                RabbitMQ down / network glitch
+                                                💥 Event lost! Downstream services never notified!
+```
+
+If the order is committed to PostgreSQL but RabbitMQ is temporarily down, the event is permanently lost, leaving downstream consumers (such as Notification Service, Inventory, and Analytics) out of sync.
+
+Conversely, if the application published to RabbitMQ before committing the database transaction, a subsequent database rollback would result in "phantom events" being processed downstream for orders that never existed.
+
+The **Transactional Outbox Pattern** eliminates this dual-write inconsistency by storing outgoing events in an `outbox_events` table inside the **exact same PostgreSQL database transaction** as the order.
+
+```
+Transactional Outbox Flow:
+1. HTTP Client ──► orderService.CreateOrder
+2. gRPC Call   ──► product_service (validate stock & price)
+3. BEGIN TRANSACTION (PostgreSQL)
+     ├── INSERT INTO orders (...)
+     ├── INSERT INTO order_items (...)
+     └── INSERT INTO outbox_events (event_id, event_type, payload, status='PENDING')
+   COMMIT TRANSACTION (Atomic guarantee: all or nothing!)
+4. HTTP 201 Created returned immediately to client
+
+--- Asynchronous Asynchronous Background Dispatch ---
+5. OutboxDispatcher (background worker):
+     ├── Safe claim: SELECT ... FOR UPDATE SKIP LOCKED
+     ├── RabbitMQ Publisher: Publish with Publisher Confirms (ACK/NACK) & mandatory routing check
+     └── If ACK: UPDATE outbox_events SET status='PUBLISHED'
+         If NACK/Err: UPDATE outbox_events SET status='PENDING', retry_count++, next_retry_at=NOW()+backoff
+```
+
+---
+
+### 12.2 Event Contract & Envelope
+
+All domain events adhere strictly to a typed envelope defined in `internal/events/order_created.go`:
+
+```json
+{
+  "event_id": "c1f7b884-6997-40c2-9e96-a189b251ff9e",
+  "event_type": "order.created",
+  "schema_version": 1,
+  "occurred_at": "2026-11-19T03:10:00Z",
+  "data": {
+    "order_id": 101,
+    "user_id": 42
+  }
+}
+```
+
+- `event_id`: Universally unique UUIDv4 string generated at event construction. Remains strictly stable across all dispatch retries.
+- `event_type`: Dot-delimited event name (`order.created`), also serving as the default AMQP routing key.
+- `schema_version`: Incremental version number allowing non-breaking schema evolution.
+- `occurred_at`: UTC timestamp recording when the business event occurred.
+- `data`: Typed domain payload (`OrderCreatedPayload`).
+
+---
+
+### 12.3 Outbox Database Schema
+
+Table `outbox_events` (migration `000002_create_outbox_table.up.sql`):
+
+| Column | Type | Constraints / Indexes | Purpose |
+|---|---|---|---|
+| `id` | `BIGSERIAL` | PRIMARY KEY | Monotonically increasing sequential identifier |
+| `event_id` | `VARCHAR(64)` | UNIQUE, INDEX | Business event UUID for idempotency |
+| `event_type` | `VARCHAR(128)` | NOT NULL | Routing and dispatch classification (`order.created`) |
+| `exchange` | `VARCHAR(128)` | NOT NULL, DEFAULT `'order.events'` | Target RabbitMQ exchange |
+| `routing_key` | `VARCHAR(128)` | NOT NULL | Target routing key |
+| `payload` | `BYTEA` | NOT NULL | Complete serialized JSON event envelope |
+| `status` | `VARCHAR(32)` | NOT NULL, DEFAULT `'PENDING'` | Lifecycle state: `PENDING`, `PROCESSING`, `PUBLISHED`, `FAILED` |
+| `retry_count` | `INTEGER` | NOT NULL, DEFAULT `0` | Number of failed publication attempts |
+| `max_retries` | `INTEGER` | NOT NULL, DEFAULT `5` | Maximum retries before moving to `FAILED` |
+| `next_retry_at` | `TIMESTAMPTZ` | NULLABLE | Scheduled timestamp for next retry attempt (exponential backoff) |
+| `last_error` | `TEXT` | NULLABLE | Error message from most recent failed publication attempt |
+| `claimed_at` | `TIMESTAMPTZ` | NULLABLE | Lease timestamp set when a worker claims the record |
+| `claimed_by` | `VARCHAR(128)` | NULLABLE | Worker ID holding the lease |
+| `published_at` | `TIMESTAMPTZ` | NULLABLE | Timestamp when broker confirmation was received |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL | Record creation timestamp |
+| `updated_at` | `TIMESTAMPTZ` | NOT NULL | Last status update timestamp |
+
+**Claim & Index Strategy**:
+- `idx_outbox_claim (status, next_retry_at, claimed_at)`: Speeds up polling for eligible records and expired worker leases.
+- `idx_outbox_event_id (event_id)`: Enforces uniqueness and fast lookups.
+
+---
+
+### 12.4 Order Creation Atomic Transaction
+
+Persistence occurs through `orderRepo.CreateOrderWithOutbox`:
+
+```go
+func (r *orderRepository) CreateOrderWithOutbox(
+    ctx context.Context,
+    order *entity.Order,
+    buildOutbox func(orderID uint64) (*entity.OutboxEvent, error),
+) error {
+    return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        // 1. Insert Order & OrderItems
+        if err := tx.Create(order).Error; err != nil {
+            return err
+        }
+
+        // 2. Build and insert OutboxEvent with the newly assigned auto-increment order.ID
+        if buildOutbox != nil {
+            outbox, err := buildOutbox(order.ID)
+            if err != nil {
+                return err
+            }
+            if err := tx.Create(outbox).Error; err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+}
+```
+
+**Guaranteed Invariants**:
+1. If the database transaction commits, both the Order header, line items, and outbox record exist.
+2. If the transaction rolls back, neither the Order nor the Outbox record exists.
+3. Order creation does not perform any network calls to RabbitMQ and succeeds even if RabbitMQ is offline.
+
+---
+
+### 12.5 RabbitMQ Publisher Implementation
+
+The Publisher (`internal/messaging/rabbitmq/publisher.go`) ensures:
+- **Durable Topic Exchange**: Declares exchange `order.events` as `durable=true`.
+- **Persistent Messages**: Sets `amqp.DeliveryMode: amqp.Persistent` (mode 2) so RabbitMQ writes messages to disk.
+- **Publisher Confirms**: Enables `Confirm(false)` on the AMQP channel. The publisher blocks on `PublishRaw` until an asynchronous broker ACK/NACK confirmation is received.
+- **Mandatory Routing Verification**: Messages are published with `mandatory: true`. If a message has no bound queue matching its routing key, RabbitMQ issues a `basic.return` before acknowledging. The publisher catches returned notifications via `NotifyReturn` and marks the publication as failed rather than falsely reporting success.
+- **Thread Safety**: Channel operations and confirm listeners are protected by a `sync.Mutex`, allowing safe concurrent usage.
+- **Lazy Reconnection**: If RabbitMQ was temporarily unreachable at application startup, the publisher automatically reconnects on demand upon the first publish call.
+
+---
+
+### 12.6 Outbox Dispatcher Lifecycle & Safe Claiming
+
+The background Dispatcher (`internal/messaging/outbox/dispatcher.go`):
+1. Runs in a dedicated background goroutine under a managed context tied to application graceful shutdown.
+2. Periodically polls for ready records using a PostgreSQL-optimized atomic claiming query:
+   ```sql
+   UPDATE outbox_events
+   SET status = 'PROCESSING',
+       claimed_at = NOW(),
+       claimed_by = :worker_id
+   WHERE id IN (
+       SELECT id FROM outbox_events
+       WHERE (
+           (status = 'PENDING' AND (next_retry_at IS NULL OR next_retry_at <= NOW()))
+           OR
+           (status = 'PROCESSING' AND claimed_at < NOW() - INTERVAL '30 seconds')
+       )
+       ORDER BY id ASC
+       LIMIT :batch_size
+       FOR UPDATE SKIP LOCKED
+   )
+   RETURNING *;
+   ```
+3. `FOR UPDATE SKIP LOCKED` guarantees that multiple dispatcher replicas (e.g. across multiple Kubernetes pods) never block each other or claim the same pending records concurrently.
+4. If a worker pod crashes mid-execution, its active claim expires after the 30-second lease window (`claimed_at < NOW() - INTERVAL '30 seconds'`), allowing surviving workers to safely claim and republish the unconfirmed events.
+
+---
+
+### 12.7 Retry Strategy & Exponential Backoff
+
+When message publication fails (broker NACK, unroutable return, or broker timeout):
+1. The record is transitioned back to `status='PENDING'`.
+2. The retry count is incremented (`retry_count++`).
+3. The error string is recorded in `last_error`.
+4. Exponential backoff is calculated:
+   $$\text{backoff} = \min(\text{InitialBackoff} \times 2^{\text{retry\_count}}, \text{MaxBackoff})$$
+   Default progression: $1\text{s} \to 2\text{s} \to 4\text{s} \to 8\text{s} \to 16\text{s} \to \dots \to 60\text{s}$ (cap).
+5. The `next_retry_at` column is updated to `NOW() + backoff`. The dispatcher skips this record on subsequent poll ticks until `next_retry_at` has elapsed.
+6. If `retry_count >= max_retries` (default 5), the record is transitioned to `status='FAILED'` for operational inspection.
+
+---
+
+### 12.8 Delivery Guarantee: At-Least-Once Delivery
+
+Consider the following failure scenario:
+1. The Dispatcher claims an outbox record and publishes it to RabbitMQ.
+2. RabbitMQ writes the message to disk, routes it, and returns a successful Publisher Confirm ACK.
+3. The Dispatcher host loses power or crashes **before** it can execute `UPDATE outbox_events SET status='PUBLISHED'`.
+4. After 30 seconds, a surviving worker re-claims the expired lease and republishes the event to RabbitMQ.
+
+**Consequence**: The event is published to RabbitMQ twice.
+
+Therefore, the system provides **AT-LEAST-ONCE delivery**, NOT exactly-once delivery.
+
+**Consumer Requirement**:
+Downstream event consumers must be designed to be idempotent:
+- Consumers must maintain an inbox/processed-events log indexed by `event_id`.
+- If an event arrives with an `event_id` that has already been processed, the consumer must acknowledge the message immediately and skip duplicate business execution.
+
+---
+
+### 12.9 Separation of Concerns
+
+| Responsibility | Order Service (`service.CreateOrder`) | Outbox Dispatcher (`outbox.Dispatcher`) |
+|---|---|---|
+| Business validations | ✅ Validates items, quantities, and user | ❌ None |
+| Product & pricing lookup | ✅ Calls gRPC product_service | ❌ None |
+| Financial precision | ✅ Integer cents calculations | ❌ None |
+| State persistence | ✅ Atomic write to `orders` and `outbox_events` | ❌ Only updates outbox metadata |
+| RabbitMQ dependency | ❌ Zero — unaware of broker status | ✅ Direct connection to RabbitMQ |
+| Network retry & backoff | ❌ None | ✅ Exponential backoff and recovery |
+| Execution lifecycle | Synchronous HTTP request boundary | Long-running managed background worker |

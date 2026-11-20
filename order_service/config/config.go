@@ -19,6 +19,7 @@ type Config struct {
 	JWTExpiration          time.Duration
 	ProductServiceGRPCAddr string
 	ProductServiceTimeout  time.Duration
+	RabbitMQURL            string
 }
 
 // LoadConfig loads environment variables from a .env file (in DEV mode) or OS environment.
@@ -78,6 +79,11 @@ func LoadConfig() (*Config, error) {
 		productGRPCAddr = "127.0.0.1:50051"
 	}
 
+	rabbitmqURL := os.Getenv("RABBITMQ_URL")
+	if rabbitmqURL == "" {
+		rabbitmqURL = "amqp://guest:guest@localhost:5672/"
+	}
+
 	timeoutSec := 3
 	if secStr := os.Getenv("PRODUCT_SERVICE_TIMEOUT_SECONDS"); secStr != "" {
 		if sec, err := strconv.Atoi(secStr); err == nil && sec > 0 {
@@ -92,9 +98,9 @@ func LoadConfig() (*Config, error) {
 		JWTSecret:              jwtSecret,
 		JWTExpiration:          24 * time.Hour,
 		ProductServiceGRPCAddr: productGRPCAddr,
+		RabbitMQURL:            rabbitmqURL,
 		ProductServiceTimeout:  time.Duration(timeoutSec) * time.Second,
 	}
 
 	return cfg, nil
 }
-

@@ -18,4 +18,3 @@ func SetupRoutes(app *fiber.App, orderHandler *handler.OrderHandler, tokenHelper
 	orders.Get("/:id", orderHandler.GetOrderDetails)
 	orders.Post("/:id/cancel", orderHandler.CancelOrder)
 }
-

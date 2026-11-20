@@ -18,7 +18,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 
-	err = db.AutoMigrate(&entity.Order{}, &entity.OrderItem{})
+	err = db.AutoMigrate(&entity.Order{}, &entity.OrderItem{}, &entity.OutboxEvent{})
 	require.NoError(t, err)
 
 	return db
@@ -157,3 +157,80 @@ func TestOrderRepository_UpdateOrderStatus_StateTransition(t *testing.T) {
 	assert.ErrorIs(t, errRepeat, repository.ErrOrderStateMismatch)
 }
 
+func TestOrderRepository_CreateOrderWithOutbox_Success(t *testing.T) {
+	db := setupTestDB(t)
+	orderRepo := repository.NewOrderRepository(db)
+	outboxRepo := repository.NewOutboxRepository(db)
+
+	order := &entity.Order{
+		UserID: 42,
+		Status: entity.OrderStatusPending,
+		Total:  99.99,
+		Items: []entity.OrderItem{
+			{ProductID: 1, ProductNameSnapshot: "Keyboard", Quantity: 1, UnitPriceSnapshot: 99.99, LineTotal: 99.99},
+		},
+	}
+
+	var capturedOrderID uint64
+	err := orderRepo.CreateOrderWithOutbox(context.Background(), order, func(orderID uint64) (*entity.OutboxEvent, error) {
+		capturedOrderID = orderID
+		return &entity.OutboxEvent{
+			EventID:    "evt-order-created-1",
+			EventType:  "order.created",
+			Exchange:   "order.events",
+			RoutingKey: "order.created",
+			Payload:    []byte(`{"order_id":1001}`),
+			Status:     entity.OutboxStatusPending,
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+		}, nil
+	})
+	require.NoError(t, err)
+
+	assert.NotZero(t, order.ID)
+	assert.Equal(t, order.ID, capturedOrderID)
+
+	// Verify order exists
+	savedOrder, err := orderRepo.GetOrderByID(context.Background(), order.ID)
+	require.NoError(t, err)
+	assert.Equal(t, uint(42), savedOrder.UserID)
+
+	// Verify outbox record exists and was persisted in same tx
+	savedOutbox, err := outboxRepo.GetEventByEventID(context.Background(), "evt-order-created-1")
+	require.NoError(t, err)
+	assert.Equal(t, entity.OutboxStatusPending, savedOutbox.Status)
+	assert.Equal(t, "order.created", savedOutbox.EventType)
+}
+
+func TestOrderRepository_CreateOrderWithOutbox_AtomicRollback(t *testing.T) {
+	db := setupTestDB(t)
+	orderRepo := repository.NewOrderRepository(db)
+
+	order := &entity.Order{
+		UserID: 42,
+		Status: entity.OrderStatusPending,
+		Total:  99.99,
+		Items: []entity.OrderItem{
+			{ProductID: 1, ProductNameSnapshot: "Keyboard", Quantity: 1, UnitPriceSnapshot: 99.99, LineTotal: 99.99},
+		},
+	}
+
+	simulatedErr := assert.AnError
+	err := orderRepo.CreateOrderWithOutbox(context.Background(), order, func(orderID uint64) (*entity.OutboxEvent, error) {
+		return nil, simulatedErr
+	})
+	assert.ErrorIs(t, err, simulatedErr)
+
+	// Verify that the order was rolled back and DOES NOT exist in the database
+	var orderCount int64
+	db.Model(&entity.Order{}).Count(&orderCount)
+	assert.Equal(t, int64(0), orderCount)
+
+	var itemCount int64
+	db.Model(&entity.OrderItem{}).Count(&itemCount)
+	assert.Equal(t, int64(0), itemCount)
+
+	var outboxCount int64
+	db.Model(&entity.OutboxEvent{}).Count(&outboxCount)
+	assert.Equal(t, int64(0), outboxCount)
+}
