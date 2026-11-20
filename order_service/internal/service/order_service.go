@@ -217,6 +217,8 @@ func (s *orderService) GetOrderByID(ctx context.Context, userID uint, orderID ui
 }
 
 // CancelOrder cancels an order if it belongs to the authenticated user and is in PENDING state.
+// It transitions the order status to CANCELLED and persists an OrderCancelled event in the
+// transactional outbox inside the exact same database transaction.
 func (s *orderService) CancelOrder(ctx context.Context, userID uint, orderID uint64) (*dto.OrderResponse, error) {
 	order, err := s.orderRepo.GetOrderByID(ctx, orderID)
 	if err != nil {
@@ -235,7 +237,32 @@ func (s *orderService) CancelOrder(ctx context.Context, userID uint, orderID uin
 		return nil, fmt.Errorf("%w: current status is %s", ErrInvalidCancellationStatus, order.Status)
 	}
 
-	if err := s.orderRepo.UpdateOrderStatus(ctx, orderID, entity.OrderStatusPending, entity.OrderStatusCancelled); err != nil {
+	reason := "User requested cancellation"
+
+	// Atomic update: transition status to CANCELLED and persist order.cancelled event in Outbox
+	err = s.orderRepo.UpdateOrderStatusWithOutbox(ctx, orderID, entity.OrderStatusPending, entity.OrderStatusCancelled, func() (*entity.OutboxEvent, error) {
+		event, err := events.NewOrderCancelledEvent(orderID, userID, reason)
+		if err != nil {
+			return nil, fmt.Errorf("failed to instantiate order.cancelled event: %w", err)
+		}
+
+		payloadBytes, err := json.Marshal(event)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize order.cancelled event: %w", err)
+		}
+
+		return &entity.OutboxEvent{
+			EventID:    event.EventID,
+			EventType:  event.EventType,
+			Exchange:   "order.events",
+			RoutingKey: event.EventType, // "order.cancelled"
+			Payload:    payloadBytes,
+			Status:     entity.OutboxStatusPending,
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+		}, nil
+	})
+	if err != nil {
 		return nil, err
 	}
 

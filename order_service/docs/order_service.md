@@ -600,10 +600,11 @@ Transactional Outbox Flow:
 
 ---
 
-### 12.2 Event Contract & Envelope
+### 12.2 Event Contract & Envelopes
 
-All domain events adhere strictly to a typed envelope defined in `internal/events/order_created.go`:
+All domain events adhere strictly to the generic envelope defined in `internal/events/order_created.go`:
 
+#### 1. `order.created` Event
 ```json
 {
   "event_id": "c1f7b884-6997-40c2-9e96-a189b251ff9e",
@@ -617,11 +618,26 @@ All domain events adhere strictly to a typed envelope defined in `internal/event
 }
 ```
 
-- `event_id`: Universally unique UUIDv4 string generated at event construction. Remains strictly stable across all dispatch retries.
-- `event_type`: Dot-delimited event name (`order.created`), also serving as the default AMQP routing key.
+#### 2. `order.cancelled` Event
+```json
+{
+  "event_id": "f2e8b112-4411-482a-99bb-bcda12345678",
+  "event_type": "order.cancelled",
+  "schema_version": 1,
+  "occurred_at": "2026-11-21T01:00:00Z",
+  "data": {
+    "order_id": 101,
+    "user_id": 42,
+    "reason": "User requested cancellation"
+  }
+}
+```
+
+- `event_id`: Universally unique UUIDv4 string generated at event construction. Remains strictly stable across all dispatch retries to allow consumer idempotency.
+- `event_type`: Dot-delimited event name (`order.created` or `order.cancelled`), serving as the AMQP routing key.
 - `schema_version`: Incremental version number allowing non-breaking schema evolution.
 - `occurred_at`: UTC timestamp recording when the business event occurred.
-- `data`: Typed domain payload (`OrderCreatedPayload`).
+- `data`: Typed domain payload (`OrderCreatedPayload` or `OrderCancelledPayload`).
 
 ---
 
@@ -654,10 +670,9 @@ Table `outbox_events` (migration `000002_create_outbox_table.up.sql`):
 
 ---
 
-### 12.4 Order Creation Atomic Transaction
+### 12.4 Atomic Transactions (Create & Cancel)
 
-Persistence occurs through `orderRepo.CreateOrderWithOutbox`:
-
+#### Order Creation (`orderRepo.CreateOrderWithOutbox`):
 ```go
 func (r *orderRepository) CreateOrderWithOutbox(
     ctx context.Context,
@@ -685,10 +700,43 @@ func (r *orderRepository) CreateOrderWithOutbox(
 }
 ```
 
+#### Order Cancellation (`orderRepo.UpdateOrderStatusWithOutbox`):
+```go
+func (r *orderRepository) UpdateOrderStatusWithOutbox(
+    ctx context.Context,
+    orderID uint64,
+    oldStatus, newStatus entity.OrderStatus,
+    buildOutbox func() (*entity.OutboxEvent, error),
+) error {
+    return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+        result := tx.Model(&entity.Order{}).
+            Where("id = ? AND status = ?", orderID, oldStatus).
+            Update("status", newStatus)
+        if result.Error != nil {
+            return result.Error
+        }
+        if result.RowsAffected == 0 {
+            return ErrOrderStateMismatch
+        }
+
+        if buildOutbox != nil {
+            outbox, err := buildOutbox()
+            if err != nil {
+                return err
+            }
+            if err := tx.Create(outbox).Error; err != nil {
+                return err
+            }
+        }
+        return nil
+    })
+}
+```
+
 **Guaranteed Invariants**:
-1. If the database transaction commits, both the Order header, line items, and outbox record exist.
-2. If the transaction rolls back, neither the Order nor the Outbox record exists.
-3. Order creation does not perform any network calls to RabbitMQ and succeeds even if RabbitMQ is offline.
+1. If the database transaction commits, both the entity state and the corresponding outbox record exist.
+2. If the transaction rolls back, no partial state exists.
+3. Order operations do not perform network calls to RabbitMQ and succeed even if RabbitMQ is offline.
 
 ---
 

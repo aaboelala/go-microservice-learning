@@ -22,6 +22,7 @@ type OrderRepository interface {
 	GetOrdersByUserID(ctx context.Context, userID uint, offset, limit int) ([]entity.Order, int64, error)
 	GetOrderByID(ctx context.Context, orderID uint64) (*entity.Order, error)
 	UpdateOrderStatus(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus) error
+	UpdateOrderStatusWithOutbox(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus, buildOutbox func() (*entity.OutboxEvent, error)) error
 }
 
 type orderRepository struct {
@@ -114,17 +115,40 @@ func (r *orderRepository) GetOrderByID(ctx context.Context, orderID uint64) (*en
 
 // UpdateOrderStatus transitions an order from oldStatus to newStatus atomically.
 func (r *orderRepository) UpdateOrderStatus(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus) error {
-	result := r.db.WithContext(ctx).
-		Model(&entity.Order{}).
-		Where("id = ? AND status = ?", orderID, oldStatus).
-		Update("status", newStatus)
-	if result.Error != nil {
-		return fmt.Errorf("failed to update order status: %w", result.Error)
-	}
+	return r.UpdateOrderStatusWithOutbox(ctx, orderID, oldStatus, newStatus, nil)
+}
 
-	if result.RowsAffected == 0 {
-		return ErrOrderStateMismatch
-	}
+// UpdateOrderStatusWithOutbox transitions an order status and persists an OutboxEvent atomically in the same transaction.
+func (r *orderRepository) UpdateOrderStatusWithOutbox(
+	ctx context.Context,
+	orderID uint64,
+	oldStatus, newStatus entity.OrderStatus,
+	buildOutbox func() (*entity.OutboxEvent, error),
+) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&entity.Order{}).
+			Where("id = ? AND status = ?", orderID, oldStatus).
+			Update("status", newStatus)
+		if result.Error != nil {
+			return fmt.Errorf("failed to update order status: %w", result.Error)
+		}
 
-	return nil
+		if result.RowsAffected == 0 {
+			return ErrOrderStateMismatch
+		}
+
+		if buildOutbox != nil {
+			outbox, err := buildOutbox()
+			if err != nil {
+				return fmt.Errorf("failed to construct outbox event: %w", err)
+			}
+			if outbox != nil {
+				if err := tx.Create(outbox).Error; err != nil {
+					return fmt.Errorf("failed to persist outbox event: %w", err)
+				}
+			}
+		}
+
+		return nil
+	})
 }

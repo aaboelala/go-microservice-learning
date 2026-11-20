@@ -234,3 +234,75 @@ func TestOrderRepository_CreateOrderWithOutbox_AtomicRollback(t *testing.T) {
 	db.Model(&entity.OutboxEvent{}).Count(&outboxCount)
 	assert.Equal(t, int64(0), outboxCount)
 }
+
+func TestOrderRepository_UpdateOrderStatusWithOutbox_Success(t *testing.T) {
+	db := setupTestDB(t)
+	orderRepo := repository.NewOrderRepository(db)
+	outboxRepo := repository.NewOutboxRepository(db)
+
+	order := &entity.Order{
+		UserID: 1,
+		Status: entity.OrderStatusPending,
+		Total:  20.0,
+		Items: []entity.OrderItem{
+			{ProductID: 1, ProductNameSnapshot: "Item", Quantity: 1, UnitPriceSnapshot: 20, LineTotal: 20},
+		},
+	}
+	require.NoError(t, orderRepo.CreateOrderWithItems(context.Background(), order))
+
+	err := orderRepo.UpdateOrderStatusWithOutbox(context.Background(), order.ID, entity.OrderStatusPending, entity.OrderStatusCancelled, func() (*entity.OutboxEvent, error) {
+		return &entity.OutboxEvent{
+			EventID:    "evt-cancel-1",
+			EventType:  "order.cancelled",
+			Exchange:   "order.events",
+			RoutingKey: "order.cancelled",
+			Payload:    []byte(`{"order_id":` + string(rune('0'+order.ID)) + `}`),
+			Status:     entity.OutboxStatusPending,
+			CreatedAt:  time.Now().UTC(),
+			UpdatedAt:  time.Now().UTC(),
+		}, nil
+	})
+	require.NoError(t, err)
+
+	// Verify order status updated
+	updated, err := orderRepo.GetOrderByID(context.Background(), order.ID)
+	require.NoError(t, err)
+	assert.Equal(t, entity.OrderStatusCancelled, updated.Status)
+
+	// Verify outbox event persisted
+	ev, err := outboxRepo.GetEventByEventID(context.Background(), "evt-cancel-1")
+	require.NoError(t, err)
+	assert.Equal(t, "order.cancelled", ev.EventType)
+	assert.Equal(t, entity.OutboxStatusPending, ev.Status)
+}
+
+func TestOrderRepository_UpdateOrderStatusWithOutbox_Rollback(t *testing.T) {
+	db := setupTestDB(t)
+	orderRepo := repository.NewOrderRepository(db)
+	outboxRepo := repository.NewOutboxRepository(db)
+
+	order := &entity.Order{
+		UserID: 1,
+		Status: entity.OrderStatusPending,
+		Total:  20.0,
+		Items: []entity.OrderItem{
+			{ProductID: 1, ProductNameSnapshot: "Item", Quantity: 1, UnitPriceSnapshot: 20, LineTotal: 20},
+		},
+	}
+	require.NoError(t, orderRepo.CreateOrderWithItems(context.Background(), order))
+
+	simErr := assert.AnError
+	err := orderRepo.UpdateOrderStatusWithOutbox(context.Background(), order.ID, entity.OrderStatusPending, entity.OrderStatusCancelled, func() (*entity.OutboxEvent, error) {
+		return nil, simErr
+	})
+	assert.ErrorIs(t, err, simErr)
+
+	// Verify status remained PENDING (not cancelled!)
+	fetched, err := orderRepo.GetOrderByID(context.Background(), order.ID)
+	require.NoError(t, err)
+	assert.Equal(t, entity.OrderStatusPending, fetched.Status)
+
+	// Verify no outbox event was saved
+	_, err = outboxRepo.GetEventByEventID(context.Background(), "evt-cancel-1")
+	assert.ErrorIs(t, err, repository.ErrOutboxEventNotFound)
+}

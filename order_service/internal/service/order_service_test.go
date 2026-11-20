@@ -39,11 +39,12 @@ func (m *mockProductClient) Close() error {
 // --- Mock Order Repository ---
 
 type mockOrderRepository struct {
-	createOrderWithItemsFn  func(ctx context.Context, order *entity.Order) error
-	createOrderWithOutboxFn func(ctx context.Context, order *entity.Order, buildOutbox func(orderID uint64) (*entity.OutboxEvent, error)) error
-	getOrdersByUserIDFn     func(ctx context.Context, userID uint, offset, limit int) ([]entity.Order, int64, error)
-	getOrderByIDFn          func(ctx context.Context, orderID uint64) (*entity.Order, error)
-	updateOrderStatusFn     func(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus) error
+	createOrderWithItemsFn        func(ctx context.Context, order *entity.Order) error
+	createOrderWithOutboxFn       func(ctx context.Context, order *entity.Order, buildOutbox func(orderID uint64) (*entity.OutboxEvent, error)) error
+	getOrdersByUserIDFn           func(ctx context.Context, userID uint, offset, limit int) ([]entity.Order, int64, error)
+	getOrderByIDFn                func(ctx context.Context, orderID uint64) (*entity.Order, error)
+	updateOrderStatusFn           func(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus) error
+	updateOrderStatusWithOutboxFn func(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus, buildOutbox func() (*entity.OutboxEvent, error)) error
 }
 
 func (m *mockOrderRepository) CreateOrderWithItems(ctx context.Context, order *entity.Order) error {
@@ -93,8 +94,28 @@ func (m *mockOrderRepository) GetOrderByID(ctx context.Context, orderID uint64) 
 }
 
 func (m *mockOrderRepository) UpdateOrderStatus(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus) error {
+	return m.UpdateOrderStatusWithOutbox(ctx, orderID, oldStatus, newStatus, nil)
+}
+
+func (m *mockOrderRepository) UpdateOrderStatusWithOutbox(
+	ctx context.Context,
+	orderID uint64,
+	oldStatus, newStatus entity.OrderStatus,
+	buildOutbox func() (*entity.OutboxEvent, error),
+) error {
+	if m.updateOrderStatusWithOutboxFn != nil {
+		return m.updateOrderStatusWithOutboxFn(ctx, orderID, oldStatus, newStatus, buildOutbox)
+	}
 	if m.updateOrderStatusFn != nil {
-		return m.updateOrderStatusFn(ctx, orderID, oldStatus, newStatus)
+		if err := m.updateOrderStatusFn(ctx, orderID, oldStatus, newStatus); err != nil {
+			return err
+		}
+		if buildOutbox != nil {
+			if _, err := buildOutbox(); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return nil
 }
@@ -688,4 +709,50 @@ func TestCancelOrder_UnsupportedStatus(t *testing.T) {
 
 	_, err := svc.CancelOrder(context.Background(), 7, 12)
 	assert.ErrorIs(t, err, service.ErrInvalidCancellationStatus)
+}
+
+func TestCancelOrder_OutboxEventPersisted(t *testing.T) {
+	order := &entity.Order{
+		ID:     88,
+		UserID: 15,
+		Status: entity.OrderStatusPending,
+	}
+
+	var capturedOutbox *entity.OutboxEvent
+	mockRepo := &mockOrderRepository{
+		getOrderByIDFn: func(ctx context.Context, orderID uint64) (*entity.Order, error) {
+			assert.Equal(t, uint64(88), orderID)
+			return order, nil
+		},
+		updateOrderStatusWithOutboxFn: func(ctx context.Context, orderID uint64, oldStatus, newStatus entity.OrderStatus, buildOutbox func() (*entity.OutboxEvent, error)) error {
+			assert.Equal(t, uint64(88), orderID)
+			assert.Equal(t, entity.OrderStatusPending, oldStatus)
+			assert.Equal(t, entity.OrderStatusCancelled, newStatus)
+
+			outbox, err := buildOutbox()
+			if err != nil {
+				return err
+			}
+			capturedOutbox = outbox
+			return nil
+		},
+	}
+
+	svc := service.NewOrderService(mockRepo, &mockProductClient{})
+
+	resp, err := svc.CancelOrder(context.Background(), 15, 88)
+	require.NoError(t, err)
+	assert.Equal(t, string(entity.OrderStatusCancelled), resp.Status)
+
+	// Verify Outbox event was properly created for order.cancelled
+	require.NotNil(t, capturedOutbox)
+	assert.NotEmpty(t, capturedOutbox.EventID)
+	assert.Equal(t, "order.cancelled", capturedOutbox.EventType)
+	assert.Equal(t, "order.events", capturedOutbox.Exchange)
+	assert.Equal(t, "order.cancelled", capturedOutbox.RoutingKey)
+	assert.Equal(t, entity.OutboxStatusPending, capturedOutbox.Status)
+	assert.Contains(t, string(capturedOutbox.Payload), `"order_id":88`)
+	assert.Contains(t, string(capturedOutbox.Payload), `"user_id":15`)
+	assert.Contains(t, string(capturedOutbox.Payload), `"event_type":"order.cancelled"`)
+	assert.Contains(t, string(capturedOutbox.Payload), `"reason":"User requested cancellation"`)
 }

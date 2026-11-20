@@ -84,9 +84,9 @@ order_service/
 
 ---
 
-## 3. الـ Flow الكامل لإنشاء طلب (CreateOrder)
+## 3. الـ Flow الكامل للعمليات والـ Outbox
 
-هذا هو أهم جزء في الـ service. فيما يلي الـ flow من لحظة وصول الـ HTTP Request حتى الرد:
+### 3.1 إنشاء طلب (CreateOrder)
 
 ```
 HTTP POST /orders  (مع JWT Token)
@@ -119,7 +119,7 @@ HTTP POST /orders  (مع JWT Token)
         │
         ├─► 4. بناء الـ OrderCreated Event
         │       NewOrderCreatedEvent(orderID, userID)
-        │       → EventEnvelope { EventID (UUID), EventType, Payload }
+        │       → EventEnvelope { EventID (UUID), EventType: "order.created", Payload }
         │
         └─► 5. Transaction واحدة (atomic) في PostgreSQL:
                 BEGIN;
@@ -132,7 +132,38 @@ HTTP POST /orders  (مع JWT Token)
               HTTP 201 Created ← يرجع فوراً بعد الـ COMMIT
 ```
 
-**ملاحظة مهمة:** الـ service لا تتصل بـ RabbitMQ إطلاقاً. كل ما تحتاجه هو PostgreSQL.
+### 3.2 إلغاء طلب (CancelOrder)
+
+```
+HTTP POST /orders/:id/cancel  (مع JWT Token)
+        │
+        ▼
+  [AuthMiddleware]  — التحقق من JWT واستخراج userID
+        │
+        ▼
+  [OrderHandler.CancelOrder]
+        │
+        ▼
+  [OrderService.CancelOrder]
+        │
+        ├─► 1. التحقق من ملكية الأوردر (order.UserID == userID)
+        ├─► 2. التحقق من حالة الأوردر (يجب أن تكون PENDING فقط)
+        │
+        ├─► 3. بناء الـ OrderCancelled Event
+        │       NewOrderCancelledEvent(orderID, userID, "User requested cancellation")
+        │       → EventEnvelope { EventID (UUID), EventType: "order.cancelled", Payload }
+        │
+        └─► 4. Transaction واحدة (atomic) في PostgreSQL:
+                BEGIN;
+                  UPDATE orders SET status = 'CANCELLED' WHERE id = :id AND status = 'PENDING';
+                  INSERT INTO outbox_events (...)  ← الـ event ("order.cancelled")
+                COMMIT;
+                        │
+                        ▼
+              HTTP 200 OK ← يرجع فوراً والـ event جاهز في الـ Outbox
+```
+
+**ملاحظة مهمة:** في الحالتين (`Create` و `Cancel`)، الـ service لا تتصل بـ RabbitMQ إطلاقاً أثناء الـ HTTP request. حفظ الحالة والـ event يتم ذرياً (atomic) داخل PostgreSQL، والـ Dispatcher يتولى النشر في الخلفية.
 
 ---
 
@@ -203,10 +234,11 @@ PENDING → PROCESSING → PUBLISHED  (نجح)
 
 ---
 
-## 6. Event Contract
+## 6. Event Contract (الحدثان المعتمدان)
 
-كل الـ events تتبع نفس الـ envelope:
+كل الـ events تتبع نفس الـ generic envelope المعرف في `internal/events/order_created.go`:
 
+### 1) حدث إنشاء الطلب (`order.created`):
 ```json
 {
     "event_id":       "c1f7b884-6997-40c2-9e96-a189b251ff9e",
@@ -220,13 +252,28 @@ PENDING → PROCESSING → PUBLISHED  (نجح)
 }
 ```
 
+### 2) حدث إلغاء الطلب (`order.cancelled`):
+```json
+{
+    "event_id":       "e845d012-32a1-432b-8a89-bcde01234567",
+    "event_type":     "order.cancelled",
+    "schema_version": 1,
+    "occurred_at":    "2026-11-21T01:00:00Z",
+    "data": {
+        "order_id": 101,
+        "user_id":  42,
+        "reason":   "User requested cancellation"
+    }
+}
+```
+
 | حقل | الغرض |
 |---|---|
-| `event_id` | UUID فريد. **ثابت** عبر جميع محاولات إعادة النشر |
-| `event_type` | اسم الـ event (`order.created`) — يستخدم كـ routing key |
+| `event_id` | UUID فريد. **ثابت** عبر جميع محاولات إعادة النشر لتمكين الـ Idempotency |
+| `event_type` | نوع الـ event (`order.created` أو `order.cancelled`) — يستخدم كـ Routing Key في RabbitMQ |
 | `schema_version` | للتطور المستقبلي للـ schema |
-| `occurred_at` | وقت حدوث الـ event في الـ service |
-| `data` | البيانات الخاصة بالـ event |
+| `occurred_at` | وقت حدوث الـ event بالـ UTC |
+| `data` | الـ Payload الخاص بالـ event (`OrderCreatedPayload` أو `OrderCancelledPayload`) |
 
 ---
 
@@ -404,6 +451,9 @@ func HandleOrderCreated(event EventEnvelope) error {
 | Graceful shutdown | `dispatcher_test.go` | إيقاف نظيف عند context cancellation |
 | RabbitMQ offline | `order_service_test.go` | إنشاء الطلب ينجح حتى بدون RabbitMQ |
 | Outbox persisted with order | `order_service_test.go` | الـ outbox يُبنى بـ order.ID الصحيح |
+| Order cancellation + outbox atomic | `order_repository_test.go` | تحديث حالة الإلغاء وحفظ حدث order.cancelled ذرياً |
+| Cancel outbox rollback on error | `order_repository_test.go` | تراجع حالة الأوردر لو فشل بناء أو حفظ الـ outbox |
+| CancelOrder outbox event generated | `order_service_test.go` | التحقق من بناء إيفنت order.cancelled والـ payload بالكامل |
 
 **نتيجة `go test -v -race ./...`:** ✅ جميع الاختبارات نجحت
 
