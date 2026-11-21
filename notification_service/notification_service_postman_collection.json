@@ -1,0 +1,493 @@
+{
+	"info": {
+		"_postman_id": "c1f7a29e-8b3d-4e91-9214-a95e7b2f4c3d",
+		"name": "Notification Service API",
+		"description": "Comprehensive Postman Collection for the In-App Notification Service (Django REST Framework) integrated with Go Order Service. Includes all 9 notification management operations, JWT authentication, and health checks.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:8000",
+			"type": "string"
+		},
+		{
+			"key": "token",
+			"value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxLCJyb2xlIjoidXNlciIsInN1YiI6ImFobWVkQGV4YW1wbGUuY29tIiwiZXhwIjoxNzk1MzIxMDU2LCJpYXQiOjE3OTUyMzQ2NTZ9.1D-wztofO0KcJacHXzCmSx-gp0ASheEytA9o0phIJvM",
+			"type": "string",
+			"description": "User token provided by User Service / Order Service"
+		},
+		{
+			"key": "tokenUser2",
+			"value": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoyLCJyb2xlIjoidXNlciIsImV4cCI6MjExMDU4MzEzOX0.w7c4AddgxWjDIp52TEvlt2Iid28K0zCGrOfG5ieyzWU",
+			"type": "string",
+			"description": "Pre-generated valid JWT token for User 2 (for testing multi-tenant cross-user isolation)"
+		},
+		{
+			"key": "notificationId",
+			"value": "e5b8d2a1-1234-4567-89ab-cdef01234567",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Health & Probes",
+			"item": [
+				{
+					"name": "Liveness Probe",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/health/liveness/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"health",
+								"liveness",
+								""
+							]
+						},
+						"description": "Verifies that the HTTP service process is running."
+					},
+					"response": []
+				},
+				{
+					"name": "Readiness Probe",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/health/readiness/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"health",
+								"readiness",
+								""
+							]
+						},
+						"description": "Verifies database connectivity."
+					},
+					"response": []
+				},
+				{
+					"name": "OpenAPI Specification",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}/api/schema/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"schema",
+								""
+							]
+						},
+						"description": "Retrieves the full OpenAPI 3.0 specification."
+					},
+					"response": []
+				}
+			]
+		},
+		{
+			"name": "Notifications Management",
+			"item": [
+				{
+					"name": "1. List Notifications (Paginated)",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/?page=1&page_size=20",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								""
+							],
+							"query": [
+								{
+									"key": "page",
+									"value": "1"
+								},
+								{
+									"key": "page_size",
+									"value": "20"
+								}
+							]
+						},
+						"description": "Returns a paginated list of notifications for the authenticated user, ordered newest first."
+					},
+					"response": []
+				},
+				{
+					"name": "1b. Filter Notifications (Unread Only)",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/?is_read=false",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								""
+							],
+							"query": [
+								{
+									"key": "is_read",
+									"value": "false"
+								}
+							]
+						},
+						"description": "Filter list by is_read=false."
+					},
+					"response": []
+				},
+				{
+					"name": "1c. Filter Notifications (By Type)",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/?notification_type=order.created",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								""
+							],
+							"query": [
+								{
+									"key": "notification_type",
+									"value": "order.created"
+								}
+							]
+						},
+						"description": "Filter notifications by type (order.created or order.cancelled)."
+					},
+					"response": []
+				},
+				{
+					"name": "2. Retrieve Notification Details",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/{{notificationId}}/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								"{{notificationId}}",
+								""
+							]
+						},
+						"description": "Retrieve complete details of a single notification owned by the authenticated user."
+					},
+					"response": []
+				},
+				{
+					"name": "3. List Unread Notifications",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/unread/?page=1&page_size=20",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								"unread",
+								""
+							],
+							"query": [
+								{
+									"key": "page",
+									"value": "1"
+								},
+								{
+									"key": "page_size",
+									"value": "20"
+								}
+							]
+						},
+						"description": "Returns unread notifications belonging to the authenticated user."
+					},
+					"response": []
+				},
+				{
+					"name": "4. Get Unread Count",
+					"request": {
+						"method": "GET",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/unread-count/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								"unread-count",
+								""
+							]
+						},
+						"description": "Returns the exact count of unread notifications for the authenticated user."
+					},
+					"response": []
+				},
+				{
+					"name": "5. Mark One Notification as Read",
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/{{notificationId}}/read/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								"{{notificationId}}",
+								"read",
+								""
+							]
+						},
+						"description": "Marks a specific notification as read and sets read_at timestamp. Safe to repeat (idempotent)."
+					},
+					"response": []
+				},
+				{
+					"name": "6. Mark One Notification as Unread",
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/{{notificationId}}/unread/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								"{{notificationId}}",
+								"unread",
+								""
+							]
+						},
+						"description": "Marks a specific notification as unread and clears read_at. Safe to repeat (idempotent)."
+					},
+					"response": []
+				},
+				{
+					"name": "7. Mark All Notifications as Read",
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/read-all/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								"read-all",
+								""
+							]
+						},
+						"description": "Marks all unread notifications of the user as read using a single database UPDATE query."
+					},
+					"response": []
+				},
+				{
+					"name": "8. Delete One Notification",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/{{notificationId}}/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								"{{notificationId}}",
+								""
+							]
+						},
+						"description": "Deletes a single notification owned by the authenticated user."
+					},
+					"response": []
+				},
+				{
+					"name": "9. Delete All Read Notifications",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{
+								"key": "Authorization",
+								"value": "Bearer {{token}}",
+								"type": "text"
+							},
+							{
+								"key": "Accept",
+								"value": "application/json",
+								"type": "text"
+							}
+						],
+						"url": {
+							"raw": "{{baseUrl}}/api/v1/notifications/read/",
+							"host": [
+								"{{baseUrl}}"
+							],
+							"path": [
+								"api",
+								"v1",
+								"notifications",
+								"read",
+								""
+							]
+						},
+						"description": "Deletes all read notifications of the user in a single database DELETE query. Preserves unread notifications."
+					},
+					"response": []
+				}
+			]
+		}
+	]
+}

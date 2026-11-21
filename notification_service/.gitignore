@@ -1,0 +1,51 @@
+# Environment variables and sensitive secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environment (project-root venv)
+bin/
+lib/
+lib64/
+include/
+pyvenv.cfg
+venv/
+.venv/
+ENV/
+env/
+
+# Byte-compiled / optimized / cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Database files
+*.sqlite3
+*.sqlite3-journal
+*.db
+
+# Pytest and testing artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Logs and debugging
+*.log
+celerybeat-schedule
+celerybeat.pid
+
+# Django static and media uploads
+staticfiles/
+media/
+
+# Editor and OS-specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

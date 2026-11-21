@@ -1,1 +1,35 @@
-*.deb
+# Environment variables and sensitive secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python virtual environments & bytecode
+**/bin/
+**/lib/
+**/lib64/
+**/include/
+**/pyvenv.cfg
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+
+# Databases
+**/*.sqlite3
+**/*.sqlite3-journal
+**/*.db
+
+# Go binaries and dependencies
+**/bin/
+**/*.exe
+**/*.out
+
+# Logs
+**/*.log
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
